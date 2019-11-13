@@ -41,6 +41,7 @@ create_timestamps <- function(start_date, end_date, opening_time, closing_time){
 
 get_data <- function(dir){
   filenames <- list.files(dir)
+  filenames <- filenames[!grepl("processed", filenames)]
   dat <- list()
   for(i in 1:length(filenames)){
     temp_dat <- fread(paste0(dir, filenames[i]))
@@ -81,6 +82,10 @@ dat <- get_data(dir)
 dat[,time_gap := (as.numeric(timestamp) - as.numeric(shift(timestamp)))/60]
 dat$time_gap[1] <- 1
 head(dat)
+```
+
+```{r}
+write.csv(dat, './dataset/toyset/processed_toyset.csv', row.names = FALSE)
 ```
 
 # Kalman Filter with known covariances
@@ -225,4 +230,135 @@ ggplot(latent_viz[currency == 'GBP' &
                     timestamp <= '2019-05-14 14:00:00']) +
   geom_line(aes(x = timestamp, y = log_intrinsic_value)) +
   ggtitle('Intrinsic value of GBP')
+```
+
+
+# Parameter Estimation
+
+
+
+```{r}
+training <- dat[10001:11000,]
+
+# E step
+
+forward_pass <- function(
+  data, initial_state, trans_mat, meas_covar, proc_covar
+){
+  obs_mat <- as.matrix(data[,!colnames(dat) %in% c('timestamp', 'time_gap'), 
+                            with = FALSE])
+  time_gap <- data$time_gap
+  
+  latent_states <- list()
+  predicted_obs <- list()
+  
+  for(i in 1:nrow(data)){
+    post_covar <- post_covar + time_gap[i] * proc_covar
+    innovation <- obs_mat[i,] - trans_mat %*% state_old
+    innovation_covar <- trans_mat %*% post_covar %*% t(trans_mat) + meas_covar
+    kalman_gain <- post_covar %*% t(trans_mat) %*% solve(innovation_covar)
+    state_new <- state_old + kalman_gain %*% innovation
+    post_covar <- (ident - kalman_gain %*% trans_mat) %*% post_covar
+    predicted_obs[[i]] <- t(trans_mat %*% state_new)
+    latent_states[[i]] <- t(state_new)
+    state_old <- state_new
+  }
+    
+  predictions <- data.table(do.call(rbind, predicted_obs))
+  setnames(predictions, colnames(obs_mat))
+  predictions$timestamp <- shift(data$timestamp, n = 1, type = 'lead')
+  predictions$time_gap <- time_gap
+  
+  latent_estimates <- data.table(do.call(rbind, latent_states))
+  setnames(latent_estimates, c('GBP', 'JPY', 'USD'))
+  latent_estimates$timestamp <- shift(data$timestamp, n = 1, type = 'lead')
+  latent_estimates$time_gap <- time_gap
+  
+  return(list(predictions, latent_estimates))
+}
+
+check <- forward_pass(
+  data = training[1:100,],
+  initial_state = rep(1, 3),
+  trans_mat = trans_mat,
+  meas_covar = meas_covar,
+  proc_covar = proc_covar
+)
+
+# M step
+
+sample_proc_covar <- function(data){
+  data <- data[complete.cases(data)]
+  time_gap <- data$time_gap
+  data <- data[,timestamp := NULL]
+  data <- data[,time_gap := NULL]
+  sample_means <- as.numeric(
+    data[,lapply(.SD, function(x) sum(x * time_gap) / sum(time_gap))]
+    )
+  data <- t((t(as.matrix(data / time_gap)) - sample_means))
+  data <- t(data) %*% data
+  return(data)
+}
+
+sample_meas_covar <- function(pred, obs){
+  unique_timestamp <- sort(unique(pred$timestamp, obs$timestamp))
+  obs_mat <- obs[timestamp %in% unique_timestamp]
+  pred_mat <- pred[timestamp %in% unique_timestamp]
+  
+  obs_mat <- as.matrix(obs_mat[order(timestamp), !c('timestamp', 'time_gap')])
+  pred_mat <- as.matrix(pred_mat[order(timestamp),][, colnames(obs_mat), with = FALSE])
+  
+  error_mat <- obs_mat - pred_mat
+  cov_mat <- cov(error_mat)
+  
+  return(cov_mat)
+}
+
+check3 <- sample_proc_covar(check[[2]])
+check4 <- sample_meas_covar(pred = check[[1]], obs = training[1:100])
+
+# EM
+
+kalman_smoother <- function(
+  data, prior_state, meas_mat, prior_df, prior_meas_scale, prior_proc_scale
+){
+  forward <- forward_pass(
+    data = data, 
+    initial_state = prior_state,
+    trans_mat = trans_mat,
+    meas_covar = prior_meas_scale / (prior_df),
+    proc_covar = prior_proc_scale / (prior_df)
+  )
+  proc_covar_new <- sample_proc_covar(forward[[2]])
+  meas_covar_new <- sample_meas_covar(pred = forward[[1]], obs = data)
+  
+  proc_covar_old <- proc_covar_new * 2
+  meas_covar_old <- meas_covar_new * 2
+  
+  while(sqrt(sum((proc_covar_old - proc_covar_new)^2) +
+        sum((meas_covar_old - meas_covar_new)^2)) > 10^(-16)){
+    print(
+      sum((proc_covar_old - proc_covar_new)^2) +
+        sum((meas_covar_old - meas_covar_new)^2)
+    )
+    
+    meas_covar_old <- meas_covar_new
+    proc_covar_old <- proc_covar_new
+    
+    forward <- forward_pass(
+      data = data,
+      initial_state = prior_state,
+      trans_mat = trans_mat,
+      meas_covar = meas_covar_new,
+      proc_covar = proc_covar_new
+    )
+    
+    proc_covar_new <- sample_proc_covar(forward[[2]])
+    meas_covar_new <- sample_meas_covar(pred = forward[[1]], obs = data)
+  }
+  
+  new_df <- prior_df + nrow(data) - nrow(trans_mat) - 1
+  
+  
+}
 ```
