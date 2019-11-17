@@ -235,19 +235,42 @@ ggplot(latent_viz[currency == 'GBP' &
 
 # Parameter Estimation
 
-
+So the goal of the project is to build an adaptive Kalman Filter. However, the problem is impossible at our current level, so we have to do a middle ground. A Kalman Smoother allows us to estimate the covariance matrices through the EM algorithm, but it requires using future data to predict the past. By combining a Kalman Smoother with PSIS detailed in the next section, we construct an algorithm to do filtering in a heuristic fashion.
 
 ```{r}
-training <- dat[10001:11000,]
+ggplot() +
+  geom_line(data = training[20:100],
+            aes(x = timestamp, y = gbpusd),
+            color = 'blue') +
+  geom_line(data = check_forward[[1]][20:100],
+            aes(x = timestamp, y = gbpusd),
+            color = 'red')
+```
+
+```{r}
+rm(list = ls(all.names = TRUE))
+trans_mat <- matrix(c(
+  1, -1, 0,
+  1, 0, -1,
+  0, -1, 1
+), nrow = 3, ncol = 3, byrow = TRUE)
+
+dat <- fread('./dataset/toyset/processed_toyset.csv')
+dat$timestamp <- as.POSIXct(dat$timestamp)
+training <- dat[10001:12000,]
 
 # E step
+# The forward pass propagates through the system, given fixed covariance matrices
+# It outputs both the predicted states and the predicted measurements
 
 forward_pass <- function(
-  data, initial_state, trans_mat, meas_covar, proc_covar
+  data, initial_state, trans_mat, meas_covar, proc_covar, post_covar
 ){
   obs_mat <- as.matrix(data[,!colnames(dat) %in% c('timestamp', 'time_gap'), 
                             with = FALSE])
   time_gap <- data$time_gap
+  state_old <- initial_state
+  ident <- diag(1, nrow = ncol(trans_mat))
   
   latent_states <- list()
   predicted_obs <- list()
@@ -274,33 +297,39 @@ forward_pass <- function(
   latent_estimates$timestamp <- shift(data$timestamp, n = 1, type = 'lead')
   latent_estimates$time_gap <- time_gap
   
-  return(list(predictions, latent_estimates))
+  return(list(predictions = predictions, 
+              latent_estimates = latent_estimates, 
+              post_covar = post_covar, 
+              innovation_covar = innovation_covar))
 }
-
-check <- forward_pass(
-  data = training[1:100,],
-  initial_state = rep(1, 3),
-  trans_mat = trans_mat,
-  meas_covar = meas_covar,
-  proc_covar = proc_covar
-)
 
 # M step
 
-sample_proc_covar <- function(data){
+sample_proc_scale <- function(data){
+# This function simply takes the scale matrix of the propagated states
+# But we have to take into account the uneven time gaps
+  
+  data <- data[,lapply(.SD, function(x) (x - shift(x, type = 'lag')) / time_gap)]
   data <- data[complete.cases(data)]
-  time_gap <- data$time_gap
   data <- data[,timestamp := NULL]
   data <- data[,time_gap := NULL]
-  sample_means <- as.numeric(
-    data[,lapply(.SD, function(x) sum(x * time_gap) / sum(time_gap))]
-    )
-  data <- t((t(as.matrix(data / time_gap)) - sample_means))
-  data <- t(data) %*% data
-  return(data)
+  proc_scale <- as.matrix(data)
+  proc_scale <- t(proc_scale) %*% proc_scale
+#  sample_means <- as.numeric(
+#    data[,lapply(.SD, function(x) sum(x * shift(time_gap, type = 'lead'), na.rm = TRUE) / 
+#        sum(shift(time_gap, type = 'lead'), na.rm = TRUE))]
+#    )
+#  sample_means <- as.numeric(data[,lapply(.SD, mean, na.rm = TRUE)])
+#  proc_scale <- t((t(as.matrix(data)) - sample_means))
+#  proc_scale <- t(proc_scale) %*% proc_scale
+#  proc_scale <- t(proc_scale) %*% diag(1/time_gap) %*% proc_scale
+  return(proc_scale)
 }
 
-sample_meas_covar <- function(pred, obs){
+sample_meas_scale <- function(pred, obs){
+# This function gets us the observed scale matrix through (biased) MLE
+# The debiasing is done by supplying the correct df to the invWishart
+
   unique_timestamp <- sort(unique(pred$timestamp, obs$timestamp))
   obs_mat <- obs[timestamp %in% unique_timestamp]
   pred_mat <- pred[timestamp %in% unique_timestamp]
@@ -309,56 +338,249 @@ sample_meas_covar <- function(pred, obs){
   pred_mat <- as.matrix(pred_mat[order(timestamp),][, colnames(obs_mat), with = FALSE])
   
   error_mat <- obs_mat - pred_mat
-  cov_mat <- cov(error_mat)
   
-  return(cov_mat)
+  return(t(error_mat) %*% error_mat)
 }
 
-check3 <- sample_proc_covar(check[[2]])
-check4 <- sample_meas_covar(pred = check[[1]], obs = training[1:100])
-
 # EM
+# This function runs the smoother on a time block through EM
 
 kalman_smoother <- function(
-  data, prior_state, meas_mat, prior_df, prior_meas_scale, prior_proc_scale
+  data, prior_state, meas_mat, post_covar,
+  prior_meas_df, prior_meas_scale, 
+  prior_proc_df, prior_proc_scale
 ){
   forward <- forward_pass(
     data = data, 
     initial_state = prior_state,
-    trans_mat = trans_mat,
-    meas_covar = prior_meas_scale / (prior_df),
-    proc_covar = prior_proc_scale / (prior_df)
+    trans_mat = meas_mat,
+    meas_covar = prior_meas_scale / (prior_meas_df),
+    proc_covar = prior_proc_scale / (prior_proc_df),
+    post_covar = post_covar
   )
-  proc_covar_new <- sample_proc_covar(forward[[2]])
-  meas_covar_new <- sample_meas_covar(pred = forward[[1]], obs = data)
+  post_proc_scale <- sample_proc_scale(forward[[2]])
+  post_meas_scale <- sample_meas_scale(pred = forward[[1]], obs = data)
   
-  proc_covar_old <- proc_covar_new * 2
-  meas_covar_old <- meas_covar_new * 2
+  old_proc_scale <- post_proc_scale * 2
+  old_meas_scale <- post_meas_scale * 2
   
-  while(sqrt(sum((proc_covar_old - proc_covar_new)^2) +
-        sum((meas_covar_old - meas_covar_new)^2)) > 10^(-16)){
+  while(sqrt(sum(((old_proc_scale - post_proc_scale) / nrow(data))^2) +
+        sum(((old_meas_scale - post_meas_scale) / nrow(data))^2)) > 10^(-12)){
     print(
-      sum((proc_covar_old - proc_covar_new)^2) +
-        sum((meas_covar_old - meas_covar_new)^2)
+      sqrt(sum(((old_proc_scale - post_proc_scale) / nrow(data))^2) +
+        sum(((old_meas_scale - post_meas_scale) / nrow(data))^2))
     )
     
-    meas_covar_old <- meas_covar_new
-    proc_covar_old <- proc_covar_new
+    old_meas_scale <- post_meas_scale
+    old_proc_scale <- post_proc_scale
     
     forward <- forward_pass(
       data = data,
       initial_state = prior_state,
       trans_mat = trans_mat,
-      meas_covar = meas_covar_new,
-      proc_covar = proc_covar_new
+      meas_covar = post_meas_scale / nrow(data),
+      proc_covar = post_proc_scale / nrow(data),
+      post_covar = post_covar
     )
     
-    proc_covar_new <- sample_proc_covar(forward[[2]])
-    meas_covar_new <- sample_meas_covar(pred = forward[[1]], obs = data)
+    post_proc_scale <- sample_proc_scale(forward[[2]])
+    post_meas_scale <- sample_meas_scale(pred = forward[[1]], obs = data)
   }
   
-  new_df <- prior_df + nrow(data) - nrow(trans_mat) - 1
+  post_meas_df <- prior_meas_df + nrow(data) - nrow(trans_mat)
+  post_proc_df <- prior_proc_df + nrow(data) - ncol(trans_mat)
   
+  return(list(
+    input_data = data,
+    states = forward[[2]],
+    predicted_measurements = forward[[1]],
+    post_meas_df = post_meas_df, 
+    post_meas_scale = prior_meas_scale + post_meas_scale,
+    post_proc_df = post_proc_df, 
+    post_proc_scale = prior_proc_scale + post_proc_scale,
+    post_covar = forward[[3]],
+    innovation_covar = forward[[4]]
+  ))
+}
+```
+
+
+```{r}
+check_forward <- forward_pass(
+  data = training[1:100],
+  initial_state = c(2.7, -2.2, 2.5),
+  trans_mat = trans_mat,
+  meas_covar = diag(0.01, 3),
+  proc_covar = diag(0.001, 3),
+  post_covar = diag(0.001, 3)
+)
+ggplot() +
+  geom_line(data = check_forward[[1]][20:100],
+            aes(x = timestamp, y = gbpusd),
+            color = 'red') +
+  geom_line(data = training[20:100],
+            aes(x = timestamp, y = gbpusd),
+            color = 'blue')
+```
+
+```{r}
+check_smoother <- kalman_smoother(
+  data = training[1:1000,],
+  prior_state = c(2.7, -2.2, 2.5),
+  meas_mat = trans_mat,
+  prior_meas_df = 100,
+  prior_meas_scale = diag(0.01^2, nrow = ncol(trans_mat)),
+  prior_proc_df = 100,
+  prior_proc_scale = diag(0.001^2, nrow = nrow(trans_mat)),
+  post_covar = diag(0.01, nrow = nrow(trans_mat))
+)
+```
+
+We inspect the Bayes estimates of the covariance matrices:
+
+```{r}
+check_smoother$post_meas_scale / (check_smoother$post_meas_df - nrow(trans_mat))
+check_smoother$post_proc_scale / (check_smoother$post_proc_df - ncol(trans_mat))
+```
+
+And can visually inspect how the smoother performs on individual currencies:
+
+```{r}
+ggplot() +
+  geom_line(data = check_smoother$predicted_measurements[500:600,],
+            aes(x = timestamp, y = usdjpy), 
+            color = 'red') +
+  geom_line(data = check_smoother$input_data[500:600],
+            aes(x = timestamp, y = usdjpy),
+            color = 'blue')
+```
+
+# PSIS
+
+PSIS is like our alarm that rings whenever the predictions become really bad and we need to update our parameters through smoothing. In particular, we fit the generalized Pareto distribution to the 20% highest importance weights, and if k > 0.7, we refit because we think the variance of the importance weights is infinity.
+
+To do this, we sample 1000 covariance matrices at the start of our forward pass through the filter and hold those fixed (covariance matrices are very expensive to sample)
+
+```{r}
+library(MCMCpack)
+library(mvtnorm)
+library(loo)
+
+# This function won't work if the priors are not reasonable
+# Please run the Kalman smoother on some historical data as a starting point
+
+kalman_filter_minibatch <- function(
+  data, meas_mat, initial_state, innovation_covar, post_covar,
+  prior_proc_df, prior_proc_scale,
+  prior_meas_df, prior_meas_scale
+){
+  proc_cov_mats <- lapply(1:1000,
+                          function(x) riwish(v = prior_proc_df, S = prior_proc_scale))
+  meas_cov_mats <- lapply(1:1000,
+                          function(x) riwish(v = prior_meas_df, S = prior_meas_scale))
+  psis_k <- 0
+  iter_count <- 1
+  data_count <- 0
+  parallel_states <- lapply(1:1000, function(x) initial_state)
+  innovation_covar_mats <- lapply(1:1000, function(x) innovation_covar)
+  post_cov_mats <- lapply(1:1000, function(x) post_covar)
+  importance_weights <- list()
   
+  while(psis_k < 0.7){
+    
+    temp_states <- mapply(
+      function(initial_state, meas_covar, proc_covar, post_covar){
+        temp_file <- forward_pass(
+          data = data[iter_count],
+          initial_state = initial_state, 
+          trans_mat = meas_mat,
+          meas_covar = meas_covar,
+          proc_covar = proc_covar,
+          post_covar = post_covar
+        )
+        return(list(
+          latent_states = as.numeric(temp_file[[2]][,1:nrow(meas_mat)]),
+          innovation_covar = temp_file[[4]],
+          post_covar = temp_file[[3]]
+          ))
+      },
+      parallel_states,
+      meas_cov_mats,
+      proc_cov_mats,
+      post_cov_mats,
+      SIMPLIFY = FALSE
+    )
+    parallel_states <- lapply(temp_states, "[[", 1)
+    innovation_covar_mats <- lapply(temp_states, "[[", 2)
+    post_covar_mats <- lapply(temp_states, "[[", 3)
+    
+    importance_weights[[iter_count]] <- as.numeric(unlist(mapply(
+      function(innovation_covar, state) dmvnorm(
+        data[iter_count+1, 2:4], # need to fix this
+        mean = trans_mat %*% state,
+        sigma = innovation_covar),
+      innovation_covar_mats, parallel_states
+    )))
+    psis_weights <- do.call('rbind', importance_weights)
+    psis_weights <- psis_weights / sd(psis_weights[1,])
+    psis_weights <- sort(exp(colSums(log(psis_weights))))[801:1000]
+    # we need to implement manually later
+    psis_k <- gpdfit(psis_weights - min(psis_weights))$k 
+    print(psis_k)
+    iter_count <- iter_count + 1
+  }
+  iter_count <- iter_count - 1
+  
+  forward <- forward_pass(
+    data = data[1:iter_count,],
+    initial_state = initial_state,
+    trans_mat = meas_mat, 
+    meas_covar = prior_meas_scale / (prior_meas_df - nrow(meas_mat)),
+    proc_covar = prior_proc_scale / (prior_proc_df - ncol(meas_mat)),
+    post_covar = post_covar
+  )
+  return(forward)
+}
+```
+
+```{r}
+check_kf_minibatch <- kalman_filter_minibatch(
+  data = training[1001:2000,], 
+  meas_mat = trans_mat, 
+  initial_state = as.numeric(check_smoother$states[nrow(check_smoother$states), 1:3]), 
+  innovation_covar = check_smoother$innovation_covar, 
+  post_covar = check_smoother$post_covar,
+  prior_proc_df = check_smoother$post_proc_df, 
+  prior_proc_scale = check_smoother$post_proc_scale,
+  prior_meas_df = check_smoother$post_meas_df, 
+  prior_meas_scale = check_smoother$post_meas_scale
+)
+ggplot(check_kf_minibatch[[2]]) +
+  geom_line(aes(x = timestamp, y = JPY))
+
+ggplot() +
+  geom_line(data = check_kf_minibatch[[1]],
+            aes(x = timestamp, y = usdjpy),
+            color = 'red') +
+  geom_line(data = training[1001:(1001+nrow(check_kf_minibatch[[1]]))],
+            aes(x = timestamp, y = usdjpy),
+            color = 'blue')
+```
+
+# Putting it all together
+
+Now that we have built a function for automatically detecting when we need to update the covariance matrix, we just need to iterate through the entire dataset until the filter has passed through the entire time series.
+
+```{r}
+adaptive_kalman_filter <- function(
+  data, meas_mat,
+  prior_proc_df, prior_proc_scale,
+  prior_meas_df, prior_meas_scale
+){
+  itercount <- 0
+  while(itercount < nrow(data)){
+    kalman_filter(stuff)
+    kalman_smoother(stuff)
+  }
 }
 ```
