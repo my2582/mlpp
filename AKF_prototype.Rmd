@@ -249,6 +249,9 @@ ggplot() +
 
 ```{r}
 rm(list = ls(all.names = TRUE))
+```
+
+```{r}
 trans_mat <- matrix(c(
   1, -1, 0,
   1, 0, -1,
@@ -366,10 +369,6 @@ kalman_smoother <- function(
   
   while(sqrt(sum(((old_proc_scale - post_proc_scale) / nrow(data))^2) +
         sum(((old_meas_scale - post_meas_scale) / nrow(data))^2)) > 10^(-9)){
-    print(
-      sqrt(sum(((old_proc_scale - post_proc_scale) / nrow(data))^2) +
-        sum(((old_meas_scale - post_meas_scale) / nrow(data))^2))
-    )
     
     old_meas_scale <- post_meas_scale
     old_proc_scale <- post_proc_scale
@@ -475,8 +474,6 @@ kalman_filter_minibatch <- function(
   prior_meas_df, prior_meas_scale
 ){
   
-  print('got inside kf minibatch')
-  
   proc_cov_mats <- lapply(1:200,
                           function(x) riwish(v = prior_proc_df, S = prior_proc_scale))
   meas_cov_mats <- lapply(1:200,
@@ -489,9 +486,7 @@ kalman_filter_minibatch <- function(
   post_cov_mats <- lapply(1:200, function(x) post_covar)
   importance_weights <- list()
   
-  print('before the while loop in minibatch')
-  
-  while(psis_k < 0.7){
+  while((psis_k < 0.7) & (iter_count < nrow(data))){
     
     temp_states <- mapply(
       function(initial_state, meas_covar, proc_covar, post_covar){
@@ -504,7 +499,9 @@ kalman_filter_minibatch <- function(
           post_covar = post_covar
         )
         return(list(
-          latent_states = as.numeric(temp_file[[2]][,1:nrow(meas_mat)]),
+          latent_states = as.numeric(
+            temp_file[[2]][nrow(temp_file[[2]]),1:nrow(meas_mat)]
+            ),
           innovation_covar = temp_file[[4]],
           post_covar = temp_file[[3]]
           ))
@@ -519,30 +516,23 @@ kalman_filter_minibatch <- function(
     innovation_covar_mats <- lapply(temp_states, "[[", 2)
     post_covar_mats <- lapply(temp_states, "[[", 3)
     
-    print('before computing importance weights')
-    
     importance_weights[[iter_count]] <- as.numeric(unlist(mapply(
       function(innovation_covar, state) dmvnorm(
-        data[iter_count+1, 2:4], # need to fix this
-        mean = trans_mat %*% state,
+        as.numeric(data[iter_count+1, 2:4]), # need to fix this
+        mean = as.numeric(trans_mat %*% state),
         sigma = innovation_covar,
         log = TRUE),
       innovation_covar_mats, parallel_states
     )))
-    print('checkpoint1')
     psis_weights <- do.call('rbind', importance_weights)
-    print(psis_weights)
-    print('checkpoint2')
-    psis_weights <- psis_weights / sd(psis_weights[1,])
-    print(psis_weights)
-    print('checkpoint3')
+#    psis_weights <- psis_weights / sd(psis_weights[1,])
+#    psis_weights <- psis_weights - sort(psis_weights[1,])[161] - 18
 #    psis_weights <- sort(exp(colSums(log(psis_weights))))[161:200]
-    psis_weights <- exp(sort(colSums(psis_weights))[161:200])
-    print(psis_weights)
+    psis_weights <- sort(colSums(psis_weights))[161:200]
+#    psis_weights <- (psis_weights)/10000000
+    psis_weights <- exp(psis_weights)
     # we need to implement manually later
-    print('checkpoint4')
-    psis_k <- gpdfit(psis_weights - min(psis_weights))$k 
-    print(psis_k)
+    psis_k <- gpdfit(psis_weights - min(psis_weights))$k
     iter_count <- iter_count + 1
   }
   iter_count <- iter_count - 1
@@ -596,6 +586,8 @@ adaptive_kalman_filter <- function(
 ){
   output_states <- list()
   output_meas <- list()
+  output_meas_covar <- list()
+  output_proc_covar <- list()
   breakpoints <- list()
   minibatch_count <- 0
   itercount <- 0
@@ -612,8 +604,6 @@ adaptive_kalman_filter <- function(
       prior_proc_scale = prior_proc_scale
     )
     
-    print('smoother ran')
-    
     itercount <- itercount + burn_in
     minibatch_count <- minibatch_count + 1
     
@@ -621,6 +611,10 @@ adaptive_kalman_filter <- function(
     
     output_states[[minibatch_count]] <- smoother[[2]]
     output_meas[[minibatch_count]] <- smoother[[3]]
+    output_meas_covar[[minibatch_count]] <- smoother[[5]] / 
+      (smoother[[4]] - nrow(meas_mat))
+    output_proc_covar[[minibatch_count]] <- smoother[[7]] /
+      (smoother[[6]] - ncol(meas_mat))
     
     # update all our priors using the smoother
     
@@ -630,18 +624,17 @@ adaptive_kalman_filter <- function(
     prior_state <- smoother[[2]]
     prior_state <- as.numeric(prior_state[nrow(prior_state), 1:ncol(meas_mat)])
     
-    prior_meas_df <- prior_meas_df / batch_total_time + smoother[[4]]
-    prior_meas_scale <- prior_meas_scale / batch_total_time + smoother[[5]]
+    prior_meas_df <- smoother[[4]]
+    prior_meas_scale <- smoother[[5]]
     
-    prior_proc_df <- prior_proc_df / batch_total_time + smoother[[6]]
-    prior_proc_scale <- prior_proc_scale / batch_total_time + smoother[[7]]
+    prior_proc_df <- smoother[[6]]
+    prior_proc_scale <- smoother[[7]]
     
     prior_covar <- smoother[[8]]
     innovation_covar <- smoother[[9]]
   }
-  
-  print('got past initial update')
 
+  print(itercount)
   
   while(itercount < nrow(data)){
     forward <- kalman_filter_minibatch(
@@ -656,11 +649,10 @@ adaptive_kalman_filter <- function(
       prior_meas_scale = prior_meas_scale
     )
     batch_size <- nrow(forward[[1]])
-    
-    print('after forward')
+    print(paste0('batch size = ', batch_size))
     
     smoother <- kalman_smoother(
-      data = data[(itercount+1):(itercount+batch_size),],
+      data = data[(itercount+1):pmin(itercount+batch_size, nrow(data)),],
       prior_state = prior_state,
       meas_mat = meas_mat,
       post_covar = prior_covar,
@@ -670,15 +662,13 @@ adaptive_kalman_filter <- function(
       prior_proc_scale = prior_proc_scale
     )
     
-    print('after smoother')
-    
     minibatch_count <- minibatch_count + 1
     itercount <- itercount + batch_size
     
     breakpoints[[minibatch_count]] <- itercount
     
     output_states[[minibatch_count]] <- smoother[[2]]
-    output_meas[[mininbatch_count]] <- smoother[[3]]
+    output_meas[[minibatch_count]] <- smoother[[3]]
     
     # update all our priors using the smoother
     
@@ -688,14 +678,16 @@ adaptive_kalman_filter <- function(
     prior_state <- smoother[[2]]
     prior_state <- as.numeric(prior_state[nrow(prior_state), 1:ncol(meas_mat)])
     
-    prior_meas_df <- prior_meas_df / batch_total_time + smoother[[4]]
-    prior_meas_scale <- prior_meas_scale / batch_total_time + smoother[[5]]
+    prior_meas_df <- smoother[[4]]
+    prior_meas_scale <- smoother[[5]]
     
-    prior_proc_df <- prior_proc_df / batch_total_time + smoother[[6]]
-    prior_proc_scale <- prior_proc_scale / batch_total_time + smoother[[7]]
+    prior_proc_df <- smoother[[6]]
+    prior_proc_scale <- smoother[[7]]
     
     prior_covar <- smoother[[8]]
     innovation_covar <- smoother[[9]]
+    
+    print(itercount)
   }
   
   output_states_combined <- rbindlist(output_states)
@@ -707,13 +699,16 @@ adaptive_kalman_filter <- function(
   return(list(
     input_data = data,
     states = output_states_combined,
-    predicted_meas = output_meas_combines,
+    predicted_meas = output_meas_combined,
     post_meas_df = prior_meas_df,
     post_meas_scale = prior_meas_scale,
-    post_proc_df = post_proc_df,
-    psot_proc_scale = post_proc_scale,
+    post_proc_df = prior_proc_df,
+    psot_proc_scale = prior_proc_scale,
     post_covar = prior_covar,
-    innovation_covar = innocation_covar
+    innovation_covar = innovation_covar,
+    breakpoints = unlist(breakpoints),
+    output_meas_covar = output_meas_covar,
+    output_proc_covar = output_proc_covar
   ))
 }
 ```
@@ -721,10 +716,12 @@ adaptive_kalman_filter <- function(
 ```{r}
 dat <- fread('./dataset/toyset/processed_toyset.csv')
 dat$timestamp <- as.POSIXct(dat$timestamp)
-dat <- dat[,lapply(.SD, function(x) x * 100), by = .(timestamp, time_gap)]
+dat$gbpjpy <- dat$gbpjpy * 100
+dat$gbpusd <- dat$gbpusd * 100
+dat$usdjpy <- dat$usdjpy * 100
 
 check_smoother_init <- kalman_smoother(
-  data = dat[19000:19999],
+  data = dat[19500:19999],
   meas_mat = trans_mat, 
   prior_state = rep(0, 3), 
   post_covar = diag(10, 3), 
@@ -736,16 +733,38 @@ check_smoother_init <- kalman_smoother(
 ```
 
 ```{r}
+ggplot() +
+  geom_line(data = check_smoother_init[[1]],
+            aes(x = timestamp, y = gbpusd),
+            color = 'blue') +
+  geom_line(data = check_smoother_init[[3]],
+            aes(x = timestamp, y = gbpusd),
+            color = 'red')
+```
+
+```{r}
 check_akf <- adaptive_kalman_filter(
-  data = dat[20000:25000], 
+  data = dat[20000:21000], 
   meas_mat = trans_mat, 
-  burn_in = 1000,
-  prior_state = rep(0, 3), 
-  prior_covar = diag(10, 3), 
-  innovation_covar = diag(0.1, 3),
-  prior_proc_df = 10, 
-  prior_proc_scale = diag(10 * 0.1, 3),
-  prior_meas_df = 10, 
-  prior_meas_scale = diag(10 * 0.1, 3)
+  burn_in = 0,
+  prior_state = as.numeric(check_smoother_init$states[
+    nrow(check_smoother_init$states), 1:ncol(trans_mat)]), 
+  prior_covar = check_smoother_init$post_covar, 
+  innovation_covar = check_smoother_init$innovation_covar,
+  prior_proc_df = check_smoother_init$post_proc_df, 
+  prior_proc_scale = check_smoother_init$post_proc_scale,
+  prior_meas_df = check_smoother_init$post_meas_df, 
+  prior_meas_scale = check_smoother_init$post_meas_scale
 )
+```
+
+```{r}
+ggplot() +
+  geom_line(data = check_akf$input_data,
+            aes(x = timestamp, y = usdjpy),
+            color = 'blue') +
+  geom_line(data = check_akf$predicted_meas,
+            aes(x = timestamp, y = usdjpy),
+            color = 'red') +
+  geom_vline(aes(xintercept = check_akf$input_data$timestamp[check_akf$breakpoints]))
 ```
