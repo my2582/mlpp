@@ -125,6 +125,7 @@ predicted_obs <- list()
 for(i in 1:nrow(dat)){
   post_covar <- post_covar + time_gap[i] * proc_covar
   innovation <- obs_mat[i,] - trans_mat %*% state_old
+  tryCatch()
   innovation_covar <- trans_mat %*% post_covar %*% t(trans_mat) + meas_covar
   kalman_gain <- post_covar %*% t(trans_mat) %*% solve(innovation_covar)
   state_new <- state_old + kalman_gain %*% innovation
@@ -285,7 +286,10 @@ forward_pass <- function(
   for(i in 1:nrow(data)){
     post_covar <- post_covar + time_gap[i] * proc_covar
     innovation <- obs_mat[i,] - trans_mat %*% state_old
-    innovation_covar <- trans_mat %*% post_covar %*% t(trans_mat) + meas_covar
+    try_innov <- try(solve(trans_mat %*% post_covar %*% t(trans_mat) + meas_covar))
+    if(is.numeric(try_innov)){
+      innovation_covar <- trans_mat %*% post_covar %*% t(trans_mat) + meas_covar
+    }
     kalman_gain <- post_covar %*% t(trans_mat) %*% solve(innovation_covar)
     state_new <- state_old + kalman_gain %*% innovation
     post_covar <- (ident - kalman_gain %*% trans_mat) %*% post_covar
@@ -613,8 +617,8 @@ adaptive_kalman_filter <- function(
     
     breakpoints[[minibatch_count]] <- itercount
     
-    output_states[[minibatch_count]] <- smoother[[2]]
-    output_meas[[minibatch_count]] <- smoother[[3]]
+    output_states[[minibatch_count]] <- forward[[2]]
+    output_meas[[minibatch_count]] <- fordward[[1]]
     output_meas_covar[[minibatch_count]] <- smoother[[5]] / 
       (smoother[[4]] - nrow(meas_mat))
     output_proc_covar[[minibatch_count]] <- smoother[[7]] /
@@ -674,8 +678,8 @@ adaptive_kalman_filter <- function(
     
     breakpoints[[minibatch_count]] <- itercount
     
-    output_states[[minibatch_count]] <- smoother[[2]]
-    output_meas[[minibatch_count]] <- smoother[[3]]
+    output_states[[minibatch_count]] <- forward[[2]]
+    output_meas[[minibatch_count]] <- forward[[1]]
     output_meas_covar[[minibatch_count]] <- smoother[[5]] / 
       (smoother[[4]] - nrow(meas_mat))
     output_proc_covar[[minibatch_count]] <- smoother[[7]] /
@@ -782,10 +786,39 @@ ggplot() +
             aes(x = timestamp, y = gbpjpy),
             color = 'red') +
   geom_vline(aes(xintercept = check_akf$input_data$timestamp[check_akf$breakpoints]))
+
+ggplot() +
+  geom_line(data = check_akf$input_data,
+            aes(x = timestamp, y = gbpusd),
+            color = 'blue') +
+  geom_line(data = check_akf$predicted_meas,
+            aes(x = timestamp, y = gbpusd),
+            color = 'red') +
+  geom_vline(aes(xintercept = check_akf$input_data$timestamp[check_akf$breakpoints]))
+
+ggplot() +
+  geom_line(data = check_akf$input_data,
+            aes(x = timestamp, y = usdjpy),
+            color = 'blue') +
+  geom_line(data = check_akf$predicted_meas,
+            aes(x = timestamp, y = usdjpy),
+            color = 'red') +
+  geom_vline(aes(xintercept = check_akf$input_data$timestamp[check_akf$breakpoints]))
 ```
 
 
 ```{r}
 ggplot(check_akf$states) +
   geom_line(aes(x = timestamp, y = GBP))
+
+ggplot(check_akf$states) +
+  geom_line(aes(x = timestamp, y = USD))
+
+ggplot(check_akf$states) +
+  geom_line(aes(x = timestamp, y = JPY))
+```
+
+```{r}
+check_akf$output_meas_covar
+check_akf$output_proc_covar
 ```
