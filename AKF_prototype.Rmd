@@ -249,6 +249,13 @@ ggplot() +
 
 ```{r}
 rm(list = ls(all.names = TRUE))
+
+dat <- fread('./dataset/toyset/processed_toyset.csv')
+dat$timestamp <- as.POSIXct(dat$timestamp)
+dat$gbpjpy <- dat$gbpjpy * 100
+dat$gbpusd <- dat$gbpusd * 100
+dat$usdjpy <- dat$usdjpy * 100
+training <- dat[10001:12000,]
 ```
 
 ```{r}
@@ -258,9 +265,6 @@ trans_mat <- matrix(c(
   0, -1, 1
 ), nrow = 3, ncol = 3, byrow = TRUE)
 
-dat <- fread('./dataset/toyset/processed_toyset.csv')
-dat$timestamp <- as.POSIXct(dat$timestamp)
-training <- dat[10001:12000,]
 
 # E step
 # The forward pass propagates through the system, given fixed covariance matrices
@@ -425,12 +429,12 @@ ggplot() +
 ```{r}
 check_smoother <- kalman_smoother(
   data = training[1:1000,],
-  prior_state = c(2.7, -2.2, 2.5),
+  prior_state = c(270, -220, 250),
   meas_mat = trans_mat,
   prior_meas_df = 100,
-  prior_meas_scale = diag(0.01^2, nrow = ncol(trans_mat)),
+  prior_meas_scale = diag(1^2, nrow = ncol(trans_mat)),
   prior_proc_df = 100,
-  prior_proc_scale = diag(0.001^2, nrow = nrow(trans_mat)),
+  prior_proc_scale = diag(0.1^2, nrow = nrow(trans_mat)),
   post_covar = diag(0.01, nrow = nrow(trans_mat))
 )
 ```
@@ -650,6 +654,9 @@ adaptive_kalman_filter <- function(
     )
     batch_size <- nrow(forward[[1]])
     print(paste0('batch size = ', batch_size))
+    if((batch_size + itercount) >= nrow(data)){
+      break
+    }
     
     smoother <- kalman_smoother(
       data = data[(itercount+1):pmin(itercount+batch_size, nrow(data)),],
@@ -669,6 +676,10 @@ adaptive_kalman_filter <- function(
     
     output_states[[minibatch_count]] <- smoother[[2]]
     output_meas[[minibatch_count]] <- smoother[[3]]
+    output_meas_covar[[minibatch_count]] <- smoother[[5]] / 
+      (smoother[[4]] - nrow(meas_mat))
+    output_proc_covar[[minibatch_count]] <- smoother[[7]] /
+      (smoother[[6]] - ncol(meas_mat))
     
     # update all our priors using the smoother
     
@@ -691,10 +702,14 @@ adaptive_kalman_filter <- function(
   }
   
   output_states_combined <- rbindlist(output_states)
-  output_states_combined$timestamp <- shift(data$timestamp, n = 1, type = 'lead')
+  output_states_combined$timestamp <- shift(
+    data$timestamp, n = 1, 
+    type = 'lead')[1:nrow(output_states_combined)]
   
   output_meas_combined <- rbindlist(output_meas)
-  output_meas_combined$timestamp <- shift(data$timestamp, n = 1, type = 'lead')
+  output_meas_combined$timestamp <- shift(
+    data$timestamp, n = 1, 
+    type = 'lead')[1:nrow(output_meas_combined)]
   
   return(list(
     input_data = data,
@@ -703,7 +718,7 @@ adaptive_kalman_filter <- function(
     post_meas_df = prior_meas_df,
     post_meas_scale = prior_meas_scale,
     post_proc_df = prior_proc_df,
-    psot_proc_scale = prior_proc_scale,
+    post_proc_scale = prior_proc_scale,
     post_covar = prior_covar,
     innovation_covar = innovation_covar,
     breakpoints = unlist(breakpoints),
@@ -744,7 +759,7 @@ ggplot() +
 
 ```{r}
 check_akf <- adaptive_kalman_filter(
-  data = dat[20000:21000], 
+  data = dat[20000:20200], 
   meas_mat = trans_mat, 
   burn_in = 0,
   prior_state = as.numeric(check_smoother_init$states[
@@ -761,10 +776,16 @@ check_akf <- adaptive_kalman_filter(
 ```{r}
 ggplot() +
   geom_line(data = check_akf$input_data,
-            aes(x = timestamp, y = usdjpy),
+            aes(x = timestamp, y = gbpjpy),
             color = 'blue') +
   geom_line(data = check_akf$predicted_meas,
-            aes(x = timestamp, y = usdjpy),
+            aes(x = timestamp, y = gbpjpy),
             color = 'red') +
   geom_vline(aes(xintercept = check_akf$input_data$timestamp[check_akf$breakpoints]))
+```
+
+
+```{r}
+ggplot(check_akf$states) +
+  geom_line(aes(x = timestamp, y = GBP))
 ```
