@@ -93,6 +93,9 @@ write.csv(dat, './dataset/toyset/processed_toyset.csv', row.names = FALSE)
 Here we assume independence in movements, just to get a simple prototype to work. proc_covar and meas_covar are the main settings. When proc_covar is relatively small when compared to meas_covar, then the filter will be smooth.
 
 ```{r}
+dat <- fread('./dataset/toyset/processed_toyset.csv')
+dat$timestamp <- as.POSIXct(dat$timestamp)
+
 proc_covar <- matrix(0, nrow = 3, ncol = 3)
 diag(proc_covar) <- 0.0001^2
 
@@ -125,7 +128,6 @@ predicted_obs <- list()
 for(i in 1:nrow(dat)){
   post_covar <- post_covar + time_gap[i] * proc_covar
   innovation <- obs_mat[i,] - trans_mat %*% state_old
-  tryCatch()
   innovation_covar <- trans_mat %*% post_covar %*% t(trans_mat) + meas_covar
   kalman_gain <- post_covar %*% t(trans_mat) %*% solve(innovation_covar)
   state_new <- state_old + kalman_gain %*% innovation
@@ -251,21 +253,35 @@ ggplot() +
 ```{r}
 rm(list = ls(all.names = TRUE))
 
-dat <- fread('./dataset/toyset/processed_toyset.csv')
+dat <- fread('./dataset/toyset/processed_toyset_v2.csv')
 dat$timestamp <- as.POSIXct(dat$timestamp)
-dat$gbpjpy <- dat$gbpjpy * 100
-dat$gbpusd <- dat$gbpusd * 100
-dat$usdjpy <- dat$usdjpy * 100
+curr_pairs <- colnames(dat)
+curr_pairs <- curr_pairs[!curr_pairs %in% c('timestamp', 'time_gap')]
+
+for(i in 1:length(curr_pairs)){
+  dat[[curr_pairs[i]]] <- dat[[curr_pairs[i]]] * 100
+}
+
+curr_list <- unique(c(
+  substring(curr_pairs, 1, 3),
+  substring(curr_pairs, 4, 6)
+))
+
 training <- dat[10001:12000,]
 ```
 
 ```{r}
-trans_mat <- matrix(c(
-  1, -1, 0,
-  1, 0, -1,
-  0, -1, 1
-), nrow = 3, ncol = 3, byrow = TRUE)
+#trans_mat <- matrix(c(
+#  1, -1, 0,
+#  1, 0, -1,
+#  0, -1, 1
+#), nrow = 3, ncol = 3, byrow = TRUE)
 
+trans_mat <- matrix(0, nrow = length(curr_pairs), ncol = length(curr_list))
+for(i in 1:length(curr_pairs)){
+  trans_mat[i, which(curr_list == substring(curr_pairs[i], 1, 3))] <- 1
+  trans_mat[i, which(curr_list == substring(curr_pairs[i], 4, 6))] <- -1
+}
 
 # E step
 # The forward pass propagates through the system, given fixed covariance matrices
@@ -304,7 +320,7 @@ forward_pass <- function(
   predictions$time_gap <- time_gap
   
   latent_estimates <- data.table(do.call(rbind, latent_states))
-  setnames(latent_estimates, c('GBP', 'JPY', 'USD')) # need to change this later
+  setnames(latent_estimates, curr_list)
   latent_estimates$timestamp <- shift(data$timestamp, n = 1, type = 'lead')
   latent_estimates$time_gap <- time_gap
   
@@ -377,6 +393,8 @@ kalman_smoother <- function(
   
   while(sqrt(sum(((old_proc_scale - post_proc_scale) / nrow(data))^2) +
         sum(((old_meas_scale - post_meas_scale) / nrow(data))^2)) > 10^(-9)){
+    print(sqrt(sum(((old_proc_scale - post_proc_scale) / nrow(data))^2) +
+        sum(((old_meas_scale - post_meas_scale) / nrow(data))^2)))
     
     old_meas_scale <- post_meas_scale
     old_proc_scale <- post_proc_scale
@@ -394,8 +412,8 @@ kalman_smoother <- function(
     post_meas_scale <- sample_meas_scale(pred = forward[[1]], obs = data)
   }
   
-  post_meas_df <- prior_meas_df + nrow(data) - nrow(trans_mat)
-  post_proc_df <- prior_proc_df + nrow(data) - ncol(trans_mat)
+  post_meas_df <- prior_meas_df + nrow(data)
+  post_proc_df <- prior_proc_df + nrow(data)
   
   return(list(
     input_data = data,
@@ -415,11 +433,11 @@ kalman_smoother <- function(
 ```{r}
 check_forward <- forward_pass(
   data = training[1:100],
-  initial_state = c(2.7, -2.2, 2.5),
+  initial_state = rep(0, 5),
   trans_mat = trans_mat,
-  meas_covar = diag(0.01, 3),
-  proc_covar = diag(0.001, 3),
-  post_covar = diag(0.001, 3)
+  meas_covar = diag(10, 9),
+  proc_covar = diag(10, 5),
+  post_covar = diag(10, 5)
 )
 ggplot() +
   geom_line(data = check_forward[[1]][20:100],
@@ -432,33 +450,33 @@ ggplot() +
 
 ```{r}
 check_smoother <- kalman_smoother(
-  data = training[1:1000,],
-  prior_state = c(270, -220, 250),
+  data = training[101:300,],
+  prior_state = as.numeric(check_forward$latent_estimates[100, 1:5]),
   meas_mat = trans_mat,
-  prior_meas_df = 100,
-  prior_meas_scale = diag(1^2, nrow = ncol(trans_mat)),
-  prior_proc_df = 100,
-  prior_proc_scale = diag(0.1^2, nrow = nrow(trans_mat)),
-  post_covar = diag(0.01, nrow = nrow(trans_mat))
+  prior_meas_df = 10,
+  prior_meas_scale = diag(10, nrow = nrow(trans_mat)),
+  prior_proc_df = 10,
+  prior_proc_scale = diag(10, nrow = ncol(trans_mat)),
+  post_covar = check_forward$post_covar
 )
 ```
 
 We inspect the Bayes estimates of the covariance matrices:
 
 ```{r}
-check_smoother$post_meas_scale / (check_smoother$post_meas_df - nrow(trans_mat))
-check_smoother$post_proc_scale / (check_smoother$post_proc_df - ncol(trans_mat))
+check_smoother$post_meas_scale / (check_smoother$post_meas_df - nrow(trans_mat) - 1)
+check_smoother$post_proc_scale / (check_smoother$post_proc_df - ncol(trans_mat) - 1)
 ```
 
 And can visually inspect how the smoother performs on individual currencies:
 
 ```{r}
 ggplot() +
-  geom_line(data = check_smoother$predicted_measurements[500:600,],
-            aes(x = timestamp, y = usdjpy), 
+  geom_line(data = check_smoother$predicted_measurements,
+            aes(x = timestamp, y = eurgbp), 
             color = 'red') +
-  geom_line(data = check_smoother$input_data[500:600],
-            aes(x = timestamp, y = usdjpy),
+  geom_line(data = check_smoother$input_data,
+            aes(x = timestamp, y = eurgbp),
             color = 'blue')
 ```
 
@@ -508,7 +526,7 @@ kalman_filter_minibatch <- function(
         )
         return(list(
           latent_states = as.numeric(
-            temp_file[[2]][nrow(temp_file[[2]]),1:nrow(meas_mat)]
+            temp_file[[2]][nrow(temp_file[[2]]),1:ncol(meas_mat)]
             ),
           innovation_covar = temp_file[[4]],
           post_covar = temp_file[[3]]
@@ -526,7 +544,9 @@ kalman_filter_minibatch <- function(
     
     importance_weights[[iter_count]] <- as.numeric(unlist(mapply(
       function(innovation_covar, state) dmvnorm(
-        as.numeric(data[iter_count+1, 2:4]), # need to fix this
+        as.numeric(data[iter_count+1, 
+                        which(colnames(data) %in% curr_pairs), 
+                        with = FALSE]), 
         mean = as.numeric(trans_mat %*% state),
         sigma = innovation_covar,
         log = TRUE),
@@ -561,7 +581,7 @@ kalman_filter_minibatch <- function(
 check_kf_minibatch <- kalman_filter_minibatch(
   data = training[1001:2000,], 
   meas_mat = trans_mat, 
-  initial_state = as.numeric(check_smoother$states[nrow(check_smoother$states), 1:3]), 
+  initial_state = as.numeric(check_smoother$states[nrow(check_smoother$states), 1:5]), 
   innovation_covar = check_smoother$innovation_covar, 
   post_covar = check_smoother$post_covar,
   prior_proc_df = check_smoother$post_proc_df, 
@@ -570,7 +590,7 @@ check_kf_minibatch <- kalman_filter_minibatch(
   prior_meas_scale = check_smoother$post_meas_scale
 )
 ggplot(check_kf_minibatch[[2]]) +
-  geom_line(aes(x = timestamp, y = JPY))
+  geom_line(aes(x = timestamp, y = jpy))
 
 ggplot() +
   geom_line(data = check_kf_minibatch[[1]],
@@ -733,21 +753,24 @@ adaptive_kalman_filter <- function(
 ```
 
 ```{r}
-dat <- fread('./dataset/toyset/processed_toyset.csv')
+dat <- fread('./dataset/toyset/processed_toyset_v2.csv')
 dat$timestamp <- as.POSIXct(dat$timestamp)
-dat$gbpjpy <- dat$gbpjpy * 100
-dat$gbpusd <- dat$gbpusd * 100
-dat$usdjpy <- dat$usdjpy * 100
+curr_pairs <- colnames(dat)
+curr_pairs <- curr_pairs[!curr_pairs %in% c('timestamp', 'time_gap')]
+
+for(i in 1:length(curr_pairs)){
+  dat[[curr_pairs[i]]] <- dat[[curr_pairs[i]]] * 100
+}
 
 check_smoother_init <- kalman_smoother(
   data = dat[19500:19999],
   meas_mat = trans_mat, 
-  prior_state = rep(0, 3), 
-  post_covar = diag(10, 3), 
+  prior_state = rep(0, 5), 
+  post_covar = diag(300, 5), 
   prior_proc_df = 10, 
-  prior_proc_scale = diag(10 * 0.1, 3),
+  prior_proc_scale = diag(10 * 0.1, 5),
   prior_meas_df = 10, 
-  prior_meas_scale = diag(10 * 0.1, 3)
+  prior_meas_scale = diag(10 * 0.1, 9)
 )
 ```
 
