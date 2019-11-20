@@ -1,13 +1,14 @@
 from scipy.stats import invwishart, multivariate_normal
 import numpy as np
-import pandas as pd
 
-from Report_EM import forward_pass, kalman_smoother, shift, update_meas_scale, update_proc_scale
+from Report_EM import forward_pass, kalman_smoother, shift
 
 nrow = 3
 ncol = 3
 
-def kalman_filter_minibatch(data, emit_mat, initial_state, innovation_covar, post_covar,
+
+def kalman_filter_minibatch(data, emit_mat, initial_state,
+                            innovation_covar, post_covar,
                             prior_proc_df, prior_proc_scale,
                             prior_meas_df, prior_meas_scale
                             ):
@@ -20,9 +21,8 @@ def kalman_filter_minibatch(data, emit_mat, initial_state, innovation_covar, pos
 
     psis_k = 0
     iter_count = 0
-    data_count = 0
-    initial_state = initial_state[1:-
-                                  1] if initial_state.shape[0] > nrow else initial_state
+    initial_state = initial_state[1:-1] \
+        if initial_state.shape[0] > nrow else initial_state
     parallel_states = np.expand_dims(initial_state, axis=0)
     parallel_states = parallel_states.repeat(batch_size, axis=0)
     innovation_covar_mats = np.expand_dims(innovation_covar, axis=0)
@@ -30,29 +30,29 @@ def kalman_filter_minibatch(data, emit_mat, initial_state, innovation_covar, pos
     post_cov_mats = np.expand_dims(post_covar, axis=0)
     post_cov_mats = post_cov_mats.repeat(batch_size, axis=0)
 
-    latent_states = []
     innovation_covar = []
     importance_weights = []
 
     while (psis_k < 0.7) and (iter_count < data_nrow):
         for i in range(parallel_states.shape[0]):
-            temp1, temp2, temp3, temp4 = forward_pass(data=data.iloc[iter_count, :],
-                                                      initial_state=initial_state,
-                                                      emit_mat=emit_mat,
-                                                      meas_covar=meas_cov_mats[i, :, :],
-                                                      proc_covar=proc_cov_mats[i, :, :],
-                                                      post_covar=post_cov_mats[i, :, :]
-                                                      )
+            temp1, temp2, temp3, temp4 = \
+                forward_pass(data=data.iloc[iter_count, :],
+                             initial_state=initial_state,
+                             emit_mat=emit_mat,
+                             meas_covar=meas_cov_mats[i, :, :],
+                             proc_covar=proc_cov_mats[i, :, :],
+                             post_covar=post_cov_mats[i, :, :])
             parallel_states[i] = temp2[-1, 1:-1]
             innovation_covar_mats[i] = temp4
             post_cov_mats[i] = temp3
 
         iw = []
         for i in range(parallel_states.shape[0]):
-            iw.append(multivariate_normal.logpdf(x=(data.iloc[iter_count, 1:-1]).astype(np.float64),
-                                                 mean=emit_mat@(
-                                                     parallel_states[i, :].astype(np.float64)),
-                                                 cov=innovation_covar_mats[i, :, :]))
+            iw.append(
+                multivariate_normal.logpdf(
+                    x=(data.iloc[iter_count, 1:-1]).astype(np.float64),
+                    mean=emit_mat@(parallel_states[i, :].astype(np.float64)),
+                    cov=innovation_covar_mats[i, :, :]))
         importance_weights.append(iw)
 
         psis_weights = np.array(importance_weights)
@@ -77,7 +77,11 @@ def kalman_filter_minibatch(data, emit_mat, initial_state, innovation_covar, pos
 
     return forward
 
-def adaptive_kalman_filter(data, emit_mat, prior_state, prior_covar, innovation_covar, prior_proc_df, prior_proc_scale, prior_meas_df, prior_meas_scale, burn_in=0):
+
+def adaptive_kalman_filter(data, emit_mat, prior_state, prior_covar,
+                           innovation_covar,
+                           prior_proc_df, prior_proc_scale, prior_meas_df,
+                           prior_meas_scale, burn_in=0):
     # print('Adaptive KF started with a prior state of', prior_state)
     output_states = []
     output_meas = []
@@ -86,7 +90,6 @@ def adaptive_kalman_filter(data, emit_mat, prior_state, prior_covar, innovation_
     breakpoints = []
     minibatch_count = 0
     itercount = 0
-    forward = []
     nrow_data = data.shape[0]
 
     while itercount < nrow_data:
@@ -126,15 +129,13 @@ def adaptive_kalman_filter(data, emit_mat, prior_state, prior_covar, innovation_
         output_states.append(forward2)
         output_meas.append(forward1)
         output_meas_covar.append(
-            smoother['post_meas_scale'] / (smoother['post_meas_df'] - emit_mat.shape[0] - 1))
+            smoother['post_meas_scale'] / (smoother['post_meas_df']
+                                           - emit_mat.shape[0] - 1))
         output_proc_covar.append(
-            smoother['post_proc_scale'] / (smoother['post_proc_df'] - emit_mat.shape[1] - 1))
-
-        # update all our priors using the smoother
-        # update all our priors using the smoother
+            smoother['post_proc_scale'] / (smoother['post_proc_df']
+                                           - emit_mat.shape[1] - 1))
 
         batch_size = smoother['input_data'].shape[0]
-        batch_total_time = np.sum(smoother['input_data'].iloc[:, -1])
 
         prior_state = forward2
         prior_state = prior_state[-1, :].astype(np.float64)
@@ -178,6 +179,7 @@ def adaptive_kalman_filter(data, emit_mat, prior_state, prior_covar, innovation_
 
     return result
 
+
 # Source: https://github.com/avehtari/PSIS/blob/master/py/psis.py
 def gpdfitnew(x, sort=True, sort_in_place=False, return_quadrature=False):
     """Estimate the paramaters for the Generalized Pareto Distribution (GPD)
@@ -195,7 +197,8 @@ def gpdfitnew(x, sort=True, sort_in_place=False, return_quadrature=False):
         If `sort` is True and `sort_in_place` is True, the array is sorted
         in-place (False by default).
     return_quadrature : bool, optional
-        If True, quadrature points and weight `ks` and `w` of the marginal posterior distribution of k are also calculated and returned. False by
+        If True, quadrature points and weight `ks` and `w` of the marginal
+        posterior distribution of k are also calculated and returned. False by
         default.
     Returns
     -------
